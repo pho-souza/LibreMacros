@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Formatação de gráficos no LibreOffice Calc (port das macros VBA do suplemento RAF).
 
-Macros expostas (Ferramentas > Macros > Executar macro > Minhas macros > graficos_raf):
+Macros expostas (Ferramentas > Macros > Executar macro > Minhas macros > formata_grafico):
 
   GraficosFonte           <- Graficos_Fonte (Ctrl+Alt+I): só formata
   GraficoTitulo           <- grafico_title (Ctrl+Alt+J): lê A3 (título), A4 (subtítulo), A5 (fonte),
@@ -84,6 +84,7 @@ ESPESSURA_GRADE = 10          # 0,01 cm = 0,1 mm = 10 centésimos de mm (UNO usa
 POSICAO_LEGENDA = "BOTTOM"    # LEFT, TOP, RIGHT ou BOTTOM
 LEGENDA_LARGURA_TOTAL = True  # legenda com 100% da largura do gráfico (só com POSICAO_LEGENDA = "BOTTOM")
 TEXTO_FONTE_PADRAO = "Fonte: "
+CONGELAR_ESTILOS = True       # congela o redesenho do gráfico durante as etapas de estilo (mais rápido); o layout é calculado descongelado
 PREFIXAR_FONTE = True         # texto de A5 sem "Fonte"/"Source" no início ganha "Fonte: " na frente
 # células da planilha (GraficoTitulo): célula em branco = ignorada
 CELULA_TITULO = "A3"
@@ -376,6 +377,32 @@ def _tem_subtitulo(modelo):
 
 def formatar_grafico(forma, modelo, avisos):
     """Aplica o padrão RAF. 'avisos' recebe o que falhar."""
+    estado = {"travado": False}
+
+    def travar():
+        if CONGELAR_ESTILOS and not estado["travado"]:
+            try:
+                modelo.lockControllers()
+                estado["travado"] = True
+            except Exception:
+                pass
+
+    def destravar():
+        if estado["travado"]:
+            try:
+                modelo.unlockControllers()
+            except Exception:
+                pass
+            estado["travado"] = False
+
+    travar()
+    try:
+        _formatar_grafico(forma, modelo, avisos, destravar)
+    finally:
+        destravar()
+
+
+def _formatar_grafico(forma, modelo, avisos, destravar):
     def tamanho():
         sz = forma.Size
         sz.Width = max(sz.Width, LARGURA_MIN)
@@ -473,6 +500,8 @@ def formatar_grafico(forma, modelo, avisos):
         except Exception:
             pass
     _tentar(avisos, "grades", grades)
+
+    destravar()    # a partir daqui o script LÊ medidas (título, legenda...): o gráfico precisa estar atualizado
 
     # ---- layout vertical dinâmico ------------------------------------------------------------
     #   topo:    título -> (subtítulo, se houver) -> área de plotagem
@@ -784,6 +813,7 @@ def _executar(nome, acao, todos=False):
         _mensagem(doc, nome, str(e))
         return
     avisos, lidos, feitos = [], [], 0
+    inicio = time.time()
     for aba, obter_forma in alvos:
         parciais = []
         try:
@@ -797,7 +827,7 @@ def _executar(nome, acao, todos=False):
         except Exception as e:
             parciais.append("%s: %s" % (type(e).__name__, e))
         avisos.extend("[%s] %s" % (aba.Name, p) for p in parciais)
-    texto = "%d gráfico(s) formatado(s)." % feitos
+    texto = "%d gráfico(s) formatado(s) em %.1f s." % (feitos, time.time() - inicio)
     if lidos:
         texto += "\n\nUsado:\n- " + "\n- ".join(lidos[:12])
     if avisos:

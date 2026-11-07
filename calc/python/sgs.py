@@ -12,6 +12,8 @@ Comportamento:
     janelas de até 10 anos indo do mais recente para o mais antigo e PARA ao passar do início
     da série (o BCB limita consultas por período a 10 anos desde 26/03/2025); intervalos
     informados maiores que 10 anos são divididos em janelas;
+  - antes de baixar, uma checagem rápida (último valor) detecta série inexistente em até TIMEOUT_EXISTENCIA_SEGUNDOS;
+    a espera por dados é maior (TIMEOUT_SEGUNDOS), porque janelas de série diária podem demorar;
   - respostas pedidas com gzip; na coluna E, cada série mostra nº de requisições, tempo de
     rede e tamanho, para ver onde o tempo foi; 429 (limite da API) respeita o Retry-After;
   - série com erro (inexistente, fora do ar, etc.) é apontada na coluna E; a coluna
@@ -54,12 +56,16 @@ EXECUCAO_ASSINCRONA = True    # baixa em segundo plano e deixa a planilha livre;
 AVISO_FINAL = "BARRA"         # ao terminar em segundo plano: "BARRA" (barra de status), "CAIXA" (janela com OK) ou None (só o log em F2)
 AVISO_SEGUNDOS = 8            # quanto tempo a mensagem da barra de status fica visível
 LIMITE_EXECUCAO_SEGUNDOS = 900  # uma execução em segundo plano que passe disso é considerada travada e não bloqueia a próxima
-TIMEOUT_SEGUNDOS = 10         # espera máxima por resposta; uma série inexistente não recebe resposta nenhuma, então esse é o tempo gasto por ela
+TIMEOUT_SEGUNDOS = 30         # espera máxima por resposta DE DADOS (uma janela de série diária pode levar 10-20 s no BCB)
+TIMEOUT_EXISTENCIA_SEGUNDOS = 8   # espera máxima pela checagem "a série existe?"; série inexistente não recebe resposta, e esse é o tempo gasto por ela
+VERIFICAR_EXISTENCIA = True   # antes de baixar, pede o último valor da série (resposta rápida) para detectar série inexistente
+JANELA_ANOS = 3               # tamanho das janelas quando a API recusa o pedido sem filtro (séries diárias); o máximo permitido é 10
 JANELA_DIAS = 3650            # < 10 anos, limite da API
 DATA_MINIMA = date(1900, 1, 1)  # início do histórico no modo de janelas (só usado no fallback)
 EPOCA_CALC = date(1899, 12, 30)
 URL_SEM_FILTRO = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{sid}/dados?formato=json"
 URL = URL_SEM_FILTRO + "&dataInicial={ini}&dataFinal={fim}"
+URL_ULTIMOS = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{sid}/dados/ultimos/1?formato=json"
 
 # CellFlags: VALUE(1) + DATETIME(2) + STRING(4) + FORMULA(16) + HARDATTR(32)
 LIMPAR = 1 | 2 | 4 | 16 | 32
@@ -97,11 +103,12 @@ def _janelas(ini, fim):
         atual = fim_janela + timedelta(days=1)
 
 
-def _janelas_retroativas(fim, ini_min):
-    """Janelas de até 10 anos, do mais recente para o mais antigo."""
+def _janelas_retroativas(fim, ini_min, dias=None):
+    """Janelas do mais recente para o mais antigo (padrão: JANELA_ANOS anos cada)."""
+    dias = dias or min(JANELA_ANOS, 10) * 365
     atual_fim = fim
     while atual_fim >= ini_min:
-        atual_ini = max(ini_min, atual_fim - timedelta(days=JANELA_DIAS - 1))
+        atual_ini = max(ini_min, atual_fim - timedelta(days=dias - 1))
         yield atual_ini, atual_fim
         atual_fim = atual_ini - timedelta(days=1)
 
@@ -113,16 +120,17 @@ def _espera_429(erro, tentativa):
         return 3.0 * (tentativa + 1)
 
 
-def _get_json(url, tentativas=3, stats=None):
+def _get_json(url, tentativas=3, stats=None, timeout=None, dica=""):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (macro SGS LibreOffice)",
                                                "Accept": "application/json", "Accept-Encoding": "gzip"})
     st = stats if stats is not None else {"req": 0, "rede": 0.0, "leitura": 0.0, "bytes": 0, "extras": 0}
+    limite = timeout or TIMEOUT_SEGUNDOS
     ultimo = None
     for t in range(tentativas):
         t0 = time.time()
         espera = 0.5 * (2 ** t)
         try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT_SEGUNDOS) as resp:
+            with urllib.request.urlopen(req, timeout=limite) as resp:
                 bruto = resp.read()
                 comprimido = (resp.headers.get("Content-Encoding") or "").lower() == "gzip"
             st["req"] += 1
@@ -147,11 +155,10 @@ def _get_json(url, tentativas=3, stats=None):
             ultimo = e
             if e.code == 429:                   # limite de requisições da API
                 espera = _espera_429(e, t)
-        except (socket.timeout, TimeoutError):  # conectou, mas o servidor não responde: série inexistente?
+        except (socket.timeout, TimeoutError):  # conectou, mas o servidor não responde
             st["req"] += 1
             st["rede"] += time.time() - t0
-            raise ErroSemResposta("sem resposta do servidor em %.0f s (a série existe? o servidor não responde a séries inexistentes)"
-                                  % TIMEOUT_SEGUNDOS)
+            raise ErroSemResposta("sem resposta do servidor em %.0f s%s" % (limite, dica))
         except (OSError, ValueError) as e:      # falha de conexão, JSON inválido
             st["rede"] += time.time() - t0
             ultimo = e
@@ -170,6 +177,25 @@ def _extrair(dados, valores):
         valores[_serial(date(int(y), int(m), int(d)))] = float(bruto)  # API usa ponto decimal
 
 
+DICA_INEXISTENTE = " (a série existe? o servidor não responde a séries inexistentes)"
+DICA_PESADA = " (consulta pesada ou servidor lento: aumente TIMEOUT_SEGUNDOS ou reduza JANELA_ANOS)"
+
+
+def _verificar_existencia(sid, stats):
+    """Pede só o último valor da série: série que existe responde na hora; a inexistente não responde.
+    Só 'sem resposta' e 404 reprovam; qualquer outra falha deixa a requisição principal decidir."""
+    try:
+        _get_json(URL_ULTIMOS.format(sid=sid), tentativas=1, stats=stats,
+                  timeout=TIMEOUT_EXISTENCIA_SEGUNDOS, dica=DICA_INEXISTENTE)
+    except ErroSemResposta:
+        raise
+    except ErroHTTP as e:
+        if e.codigo == 404:
+            raise
+    except RuntimeError:
+        pass
+
+
 def baixar_serie(sid, ini, fim, stats=None):
     """Devolve [("", {número_de_série_da_data: valor})].
 
@@ -178,9 +204,11 @@ def baixar_serie(sid, ini, fim, stats=None):
     dados (o início da série). Série inexistente (404) falha na hora, sem fallback.
     """
     valores = {}
+    if VERIFICAR_EXISTENCIA:
+        _verificar_existencia(sid, stats)
     if ini is None and fim is None:
         try:
-            _extrair(_get_json(URL_SEM_FILTRO.format(sid=sid), stats=stats), valores)
+            _extrair(_get_json(URL_SEM_FILTRO.format(sid=sid), stats=stats, dica=DICA_PESADA), valores)
             return [("", valores)]
         except ErroHTTP as e:
             if e.codigo == 404:
@@ -195,13 +223,13 @@ def baixar_serie(sid, ini, fim, stats=None):
         for a, b in _janelas_retroativas(fim, DATA_MINIMA):
             antes = len(valores)
             _extrair(_get_json(URL.format(sid=sid, ini=a.strftime("%d/%m/%Y"), fim=b.strftime("%d/%m/%Y")),
-                               stats=stats), valores)
+                               stats=stats, dica=DICA_PESADA), valores)
             if valores and len(valores) == antes:     # janela vazia depois de já ter dados: acabou o histórico
                 break
     else:
         for a, b in _janelas(ini, fim):
             _extrair(_get_json(URL.format(sid=sid, ini=a.strftime("%d/%m/%Y"), fim=b.strftime("%d/%m/%Y")),
-                               stats=stats), valores)
+                               stats=stats, dica=DICA_PESADA), valores)
     return [("", valores)]
 
 
